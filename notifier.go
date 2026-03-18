@@ -12,20 +12,16 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type Notifer interface {
+type Notifier interface {
 	Send(ctx context.Context, msg Message) error
 	Stats() Stats
 	Close() error
 }
 
-type ExternalClient interface {
-	Post(ctx context.Context, msg Message) (statusCode int, err error)
-}
-
 type notifier struct {
 	client     ExternalClient
 	limiter    *rate.Limiter
-	taskQ      chan Message
+	taskQ      chan Task
 	qClosed    atomic.Int32
 	wg         sync.WaitGroup
 	maxRetries int
@@ -34,19 +30,26 @@ type notifier struct {
 	Retries    atomic.Int64 // количество повторных попыток
 }
 
+type ExternalClient interface {
+	Post(ctx context.Context, msg Message) (statusCode int, err error)
+}
+
+type Task struct {
+	msg Message
+	ctx context.Context
+}
+
 // queue states
 const (
 	closed = 1
 	open   = 0
 )
 
-const maxRetries = 3
-
-func NewNotifier(client ExternalClient, workers, ratePerSecond int) Notifer {
+func NewNotifier(client ExternalClient, workers, ratePerSecond, maxRetries int) Notifier {
 	n := &notifier{
 		client:     client,
 		limiter:    rate.NewLimiter(rate.Limit(ratePerSecond), ratePerSecond),
-		taskQ:      make(chan Message, workers*2),
+		taskQ:      make(chan Task, workers*2),
 		maxRetries: maxRetries,
 	}
 	n.qClosed.Store(open)
@@ -61,7 +64,7 @@ func (n *notifier) Send(ctx context.Context, msg Message) error {
 		return ErrClosed
 	}
 	select {
-	case n.taskQ <- msg:
+	case n.taskQ <- Task{msg: msg, ctx: ctx}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -69,7 +72,7 @@ func (n *notifier) Send(ctx context.Context, msg Message) error {
 }
 
 func (n *notifier) Close() error {
-	if !n.qClosed.CompareAndSwap(0, 1) {
+	if !n.qClosed.CompareAndSwap(open, closed) {
 		return ErrClosed
 	}
 	close(n.taskQ)
@@ -87,27 +90,36 @@ func (n *notifier) Stats() Stats {
 
 func (n *notifier) worker() {
 	defer n.wg.Done()
-	for msg := range n.taskQ {
-		if err := n.process(msg); err != nil {
-			log.Printf("failed to process message: %v\n", err)
+	for task := range n.taskQ {
+		if err := n.process(task.ctx, task.msg); err != nil {
+			log.Printf("failed to process message {%s}: %v\n", task.msg, err)
 		}
 	}
 }
 
-func (n *notifier) process(msg Message) error {
+func (n *notifier) process(ctx context.Context, msg Message) error {
 	var lastErr error
-	for attempt := range n.maxRetries {
-		if err := n.limiter.Wait(context.Background()); err != nil {
+	for attempt := 1; attempt <= n.maxRetries+1; attempt++ {
+		select {
+		case <-ctx.Done():
+			n.Failed.Add(1)
+			return ctx.Err()
+		default:
+		}
+
+		if err := n.limiter.Wait(ctx); err != nil {
+			n.Failed.Add(1)
 			return err
 		}
-		status, err := n.client.Post(context.Background(), msg)
+
+		status, err := n.client.Post(ctx, msg)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if status == http.StatusTooManyRequests {
-			n.Retries.Add(1)
 			if attempt != n.maxRetries-1 {
+				n.Retries.Add(1)
 				backoff := backoff.GetDelay(attempt)
 				time.Sleep(backoff)
 			}
@@ -118,6 +130,7 @@ func (n *notifier) process(msg Message) error {
 			return nil
 		}
 		lastErr = ErrUnexpectedStatus
+		break
 	}
 	n.Failed.Add(1)
 	return lastErr
