@@ -47,8 +47,9 @@ const (
 
 func NewNotifier(client ExternalClient, workers, ratePerSecond, maxRetries int) Notifier {
 	n := &notifier{
-		client:     client,
-		limiter:    rate.NewLimiter(rate.Limit(ratePerSecond), ratePerSecond),
+		client: client,
+		// limiter:    rate.NewLimiter(rate.Limit(ratePerSecond), ratePerSecond),
+		limiter:    rate.NewLimiter(rate.Limit(ratePerSecond), 1),
 		taskQ:      make(chan Task, workers*2),
 		maxRetries: maxRetries,
 	}
@@ -63,11 +64,14 @@ func (n *notifier) Send(ctx context.Context, msg Message) error {
 	if n.qClosed.Load() == closed {
 		return ErrClosed
 	}
+
 	select {
-	case n.taskQ <- Task{msg: msg, ctx: ctx}:
-		return nil
 	case <-ctx.Done():
+		n.Failed.Add(1)
 		return ctx.Err()
+	default:
+		n.taskQ <- Task{msg: msg, ctx: ctx}
+		return nil
 	}
 }
 
@@ -89,16 +93,16 @@ func (n *notifier) Stats() Stats {
 }
 
 func (n *notifier) worker() {
-	defer n.wg.Done()
 	for task := range n.taskQ {
 		if err := n.process(task.ctx, task.msg); err != nil {
-			log.Printf("failed to process message {%s}: %v\n", task.msg, err)
+			log.Printf("failed to process message [%s]:{%s}: %v\n", task.msg.ID, task.msg.Payload, err)
 		}
 	}
 }
 
 func (n *notifier) process(ctx context.Context, msg Message) error {
 	var lastErr error
+	// 1 attempt and n.MaxRetries retries
 	for attempt := 1; attempt <= n.maxRetries+1; attempt++ {
 		select {
 		case <-ctx.Done():
@@ -118,7 +122,7 @@ func (n *notifier) process(ctx context.Context, msg Message) error {
 			continue
 		}
 		if status == http.StatusTooManyRequests {
-			if attempt != n.maxRetries-1 {
+			if attempt != n.maxRetries+1 {
 				n.Retries.Add(1)
 				backoff := backoff.GetDelay(attempt)
 				time.Sleep(backoff)
